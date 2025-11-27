@@ -7,4 +7,5 @@ dependencies:
   - scikit-learn
   - beautifulsoup4
   - requests
+  - xgboost
 
