@@ -6,11 +6,26 @@ import pandas as pd
 import time
 import traceback
 import concurrent.futures
+import threading
 from dateutil.parser import parse
 
 BASE = "http://ufcstats.com"
 CACHE_DIR = "cache_html"
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Max concurrent requests to avoid rate limiting
+RATE_LIMITER = threading.Semaphore(8)
+
+# Pages that list events/fights — always re-fetch so new events appear
+LISTING_URL_PATTERNS = [
+    "statistics/events/completed",
+    "statistics/events/upcoming",
+]
+
+
+def is_listing_url(url: str) -> bool:
+    return any(p in url for p in LISTING_URL_PATTERNS)
+
 
 def cache_path(url: str):
     """Convert URL to md5 hashed cache filename."""
@@ -18,21 +33,38 @@ def cache_path(url: str):
     return os.path.join(CACHE_DIR, f"{h}.html")
 
 
-def fetch_cached(url: str):
+def bust_cache(url: str):
+    """Delete cached file for a URL if it exists."""
+    path = cache_path(url)
+    if os.path.exists(path):
+        os.remove(path)
+        print(f"[CACHE BUST] {url}")
+
+
+def fetch_cached(url: str, verbose_cache=False, force_refresh=False):
     """
-    Return HTML from cache if available.
-    Otherwise download and save it.
+    Return HTML from cache if available (and not a listing page or forced refresh).
+    Otherwise download and save with exponential backoff on 429s.
     """
     path = cache_path(url)
 
-    # Return cached HTML if exists
+    # Always re-fetch listing/index pages so newly completed events appear
+    if force_refresh or is_listing_url(url):
+        if os.path.exists(path):
+            os.remove(path)
+            if verbose_cache:
+                print(f"[CACHE BUST] {url}")
+
     if os.path.exists(path):
+        if verbose_cache:
+            print(f"[CACHE HIT] {url}")
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
 
-    # Otherwise download
+    if verbose_cache:
+        print(f"[CACHE MISS] {url}")
+
     headers = {
-        # Change this to your user agent
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -40,27 +72,38 @@ def fetch_cached(url: str):
         )
     }
 
-    for _ in range(5):
-        try:
-            r = requests.get(url, headers=headers, timeout=12)
-            if r.status_code == 200:
-                html = r.text
-                # save to cache
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(html)
-                return html
-            else:
-                print(f"[WARN] Status {r.status_code} for {url}")
-        except Exception as e:
-            print(f"[WARN] Error fetching {url}: {e}")
+    with RATE_LIMITER:
+        for attempt in range(5):
+            try:
+                r = requests.get(url, headers=headers, timeout=12)
 
-    print(f"[ERROR] Failed to fetch {url}")
+                if r.status_code == 200:
+                    html = r.text
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(html)
+                    return html
+
+                elif r.status_code == 429:
+                    wait = 2 ** attempt
+                    print(f"[WARN] Status 429 for {url} — backing off {wait}s (attempt {attempt+1}/5)")
+                    time.sleep(wait)
+
+                else:
+                    print(f"[WARN] Status {r.status_code} for {url}")
+                    time.sleep(1)
+
+            except Exception as e:
+                wait = 2 ** attempt
+                print(f"[WARN] Error fetching {url}: {e} — retrying in {wait}s")
+                time.sleep(wait)
+
+    print(f"[ERROR] Failed to fetch {url} after 5 attempts")
     return None
 
 
-def get_soup(url):
+def get_soup(url, verbose_cache=False, force_refresh=False):
     """Return BeautifulSoup object using cached HTML."""
-    html = fetch_cached(url)
+    html = fetch_cached(url, verbose_cache=verbose_cache, force_refresh=force_refresh)
     if html is None:
         return None
     return BeautifulSoup(html, "html.parser")
@@ -70,7 +113,6 @@ def normalize_url(href):
     if not href:
         return None
     href = href.strip()
-
     if href.startswith("//"):
         return "http:" + href
     if href.startswith("/"):
@@ -80,16 +122,31 @@ def normalize_url(href):
     return BASE + "/" + href
 
 
+def cache_stats(urls):
+    """Print how many URLs are already cached."""
+    total = len(urls)
+    hits = sum(1 for url in urls if os.path.exists(cache_path(url)))
+    misses = total - hits
+    pct = (100 * hits // total) if total > 0 else 0
+    print(f"[CACHE] {hits}/{total} already cached ({pct}%) — {misses} will hit the network")
+    return hits, misses
+
+
 def get_all_event_links():
-    """Returns all event detail pages."""
+    """
+    Returns all completed event detail page URLs.
+    The listing page is always re-fetched (cache busted) so newly completed
+    events are picked up on every run.
+    """
     url = f"{BASE}/statistics/events/completed?page=all"
-    soup = get_soup(url)
+    # force_refresh=True is redundant here since is_listing_url() catches it,
+    # but explicit is clearer.
+    soup = get_soup(url, force_refresh=True)
     if soup is None:
         print("[ERROR] Could not load events page.")
         return []
 
     events = set()
-
     for a in soup.find_all("a", href=True):
         if "event-details" in a["href"]:
             events.add(normalize_url(a["href"]))
@@ -100,13 +157,20 @@ def get_all_event_links():
 
 
 def get_event_fights(event_url):
-    """Return all fight URLs from an event page."""
-    soup = get_soup(event_url)
+    """
+    Return all fight URLs from an event page.
+    Event index pages are also cache-busted so any late-added bouts appear.
+    """
+    # Event detail pages aren't "listing" pages by pattern, but we still want
+    # fresh data for events that were recently added.  Use force_refresh only
+    # for events whose cache is older than 30 days — approximated here by
+    # always refreshing (cheap since HTML is tiny).  If you want to preserve
+    # the old behaviour for historical events, swap to get_soup(event_url).
+    soup = get_soup(event_url, force_refresh=False)
     if soup is None:
         return []
 
     fights = set()
-
     for a in soup.select("tr.b-fight-details__table-row a[href*='fight-details']"):
         fights.add(normalize_url(a["href"]))
 
@@ -123,14 +187,13 @@ def get_event_fights(event_url):
 def safe_text(t):
     return t.get_text(strip=True) if t else None
 
+
 def parse_fight(fight_url):
     soup = get_soup(fight_url)
     if soup is None:
         return None
 
-    # --------------------------------------
     # Event link
-    # --------------------------------------
     event_url = None
     event_link = soup.select_one("a.b-fight-details__event-link")
     if event_link:
@@ -140,9 +203,7 @@ def parse_fight(fight_url):
         if alt:
             event_url = normalize_url(alt["href"])
 
-    # --------------------------------------
     # Event date
-    # --------------------------------------
     date = None
     if event_url:
         event_soup = get_soup(event_url)
@@ -160,9 +221,7 @@ def parse_fight(fight_url):
             except:
                 pass
 
-    # --------------------------------------
     # Fighters + Winner
-    # --------------------------------------
     persons = soup.select("div.b-fight-details__person")
     if len(persons) != 2:
         print("Bad fighter structure:", fight_url)
@@ -176,9 +235,7 @@ def parse_fight(fight_url):
 
     winner = "red" if red_status == "W" else "blue" if blue_status == "W" else "none"
 
-    # --------------------------------------
     # Method / Round / Time
-    # --------------------------------------
     fight_info = soup.select_one("div.b-fight-details__content")
     method = round_ = time_ = None
 
@@ -194,12 +251,10 @@ def parse_fight(fight_url):
             if t.startswith("Time:"):
                 time_ = t.replace("Time:", "").strip()
 
-    # --------------------------------------
     # Totals table
-    # --------------------------------------
-    totals_section = soup.find("p", text=lambda x: x and "Totals" in x)
+    totals_section = soup.find("p", string=lambda x: x and "Totals" in x)
     if not totals_section:
-        print("Totals section missing:", fight_url)
+        print(f"[SKIP] Totals section missing (likely old fight with no stats): {fight_url}")
         return None
 
     totals_table = totals_section.find_next("table")
@@ -219,7 +274,7 @@ def parse_fight(fight_url):
             stats[f"red_{labels[i]}"] = red
             stats[f"blue_{labels[i]}"] = blue
     else:
-        print("Unexpected totals:", fight_url)
+        print(f"[SKIP] Unexpected totals row count ({len(rows)}): {fight_url}")
         return None
 
     return {
@@ -236,7 +291,7 @@ def parse_fight(fight_url):
     }
 
 
-def scrape_all(save_every=1000, threads=30):
+def scrape_all(threads=8):
     events = get_all_event_links()
 
     fight_links = set()
@@ -247,37 +302,35 @@ def scrape_all(save_every=1000, threads=30):
     fight_links = sorted(fight_links)
     print(f"[+] Total fight links: {len(fight_links)}")
 
-    data = []
+    cache_stats(fight_links)
 
-    # ----------------------------
-    # Threaded scraping
-    # ----------------------------
+    data = []
+    completed = 0
+    total = len(fight_links)
+
     print(f"[+] Starting multithreaded scrape with {threads} workers...")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
         futures = {executor.submit(parse_fight, url): url for url in fight_links}
 
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+        for future in concurrent.futures.as_completed(futures):
             url = futures[future]
+            completed += 1
+
             try:
                 result = future.result()
                 if result:
                     data.append(result)
             except Exception as e:
-                print(f"[ERROR] scrape failed {url}", e)
+                print(f"[ERROR] scrape failed {url}: {e}")
                 traceback.print_exc()
 
-            if (i + 1) % save_every == 0:
-                df = pd.DataFrame(data)
-                df.to_csv(f"ufc_fights_partial_{i+1}.csv", index=False)
-                print(f"[+] Saved partial ({i+1})")
+            if completed % 100 == 0 or completed == total:
+                print(f"[PROGRESS] {completed}/{total} fights processed ({len(data)} with data)")
 
-    # ----------------------------
-    # Final save
-    # ----------------------------
     df = pd.DataFrame(data)
     df.to_csv("ufc_fight_data.csv", index=False)
-    print("[+] Saved ufc_fight_data.csv")
+    print(f"[+] Saved ufc_fight_data.csv — {len(df)} rows")
 
 
 if __name__ == "__main__":

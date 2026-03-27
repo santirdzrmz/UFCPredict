@@ -4,8 +4,11 @@ channels:
 dependencies:
   - python=3.12
   - pandas
+  - numpy
   - scikit-learn
   - beautifulsoup4
   - requests
+  - python-dateutil
   - xgboost
+  - jupyter
 
